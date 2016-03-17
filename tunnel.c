@@ -14,11 +14,16 @@
 #include <linux/if_tun.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <pwd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
+#include <unistd.h>
+
+
+#define DEFAULT_ROUTE   "0.0.0.0"
 
 /**
  * Function to allocate a tunnel
@@ -28,13 +33,13 @@ int tun_alloc(char *dev, int flags)
   struct ifreq ifr;
   int tun_fd, err;
   char *clonedev = "/dev/net/tun";
-  printf("[DEBUG] Allocatating tunnel\n");
+  printf("[DEBUG] Allocating tunnel\n");
 
   tun_fd = open(clonedev, O_RDWR);
 
   if(tun_fd == -1) {
     perror("Unable to open clone device\n");
-    exit(-1);
+    exit(EXIT_FAILURE);
   }
   
   memset(&ifr, 0, sizeof(ifr));
@@ -47,8 +52,9 @@ int tun_alloc(char *dev, int flags)
 
   if ((err=ioctl(tun_fd, TUNSETIFF, (void *)&ifr)) < 0) {
     close(tun_fd);
-    printf("Error: %d\n", err);
-    exit(-1);
+    fprintf(stderr, "Error returned by ioctl(): %s\n", strerror(err));
+    perror("Error in tun_alloc()\n");
+    exit(EXIT_FAILURE);
   }
 
   printf("[DEBUG] Allocatating tunnel2");
@@ -69,7 +75,7 @@ int tun_read(int tun_fd, char *buffer, int length)
 
   if (bytes_read == -1) {
     perror("Unable to read from tunnel\n");
-    exit(-1);
+    exit(EXIT_FAILURE);
   }
   else {
     return bytes_read;
@@ -87,7 +93,7 @@ int tun_write(int tun_fd, char *buffer, int length)
 
   if (bytes_written == -1) {
     perror("Unable to write to tunnel\n");
-    exit(-1);
+    exit(EXIT_FAILURE);
   }
   else {
     return bytes_written;
@@ -104,17 +110,25 @@ void configure_network(int server)
   char *const args[] = {path, NULL};
 
   if (server) {
-    strcpy(path, SERVER_SCRIPT);
+    if (sizeof(SERVER_SCRIPT) > sizeof(path)){
+      perror("Server script path is too long\n");
+      exit(EXIT_FAILURE);
+    }
+    strncpy(path, SERVER_SCRIPT, strlen(SERVER_SCRIPT) + 1);
   }
   else {
-    strcpy(path, CLIENT_SCRIPT);
+    if (sizeof(CLIENT_SCRIPT) > sizeof(path)){
+      perror("Client script path is too long\n");
+      exit(EXIT_FAILURE);
+    }
+    strncpy(path, CLIENT_SCRIPT, strlen(CLIENT_SCRIPT) + 1);
   }
 
   pid = fork();
 
   if (pid == -1) {
     perror("Unable to fork\n");
-    exit(-1);
+    exit(EXIT_FAILURE);
   }
   
   if (pid==0) {
@@ -174,19 +188,38 @@ void run_tunnel(char *dest, int server)
       // Preparing ICMP packet to be sent
       memset(&packet, 0, sizeof(struct icmp_packet));
       printf("[DEBUG] Destination address: %s\n", dest);
-      strcpy(packet.src_addr, "0.0.0.0");
-      strcpy(packet.dest_addr, dest);
+
+      if (sizeof(DEFAULT_ROUTE) > sizeof(packet.src_addr)){
+        perror("Lack of space: size of DEFAULT_ROUTE > size of src_addr\n");
+        close(tun_fd);
+        close(sock_fd);
+        exit(EXIT_FAILURE);
+      }
+      strncpy(packet.src_addr, DEFAULT_ROUTE, strlen(DEFAULT_ROUTE) + 1);
+
+      if ((strlen(dest) + 1) > sizeof(packet.dest_addr)){
+        perror("Lack of space for copy size of DEFAULT_ROUTE > size of dest_addr\n");
+        close(sock_fd);
+        exit(EXIT_FAILURE);
+      }
+      strncpy(packet.dest_addr, dest, strlen(dest) + 1);
+
       if(server) {
         set_reply_type(&packet);
       }
       else {
         set_echo_type(&packet);
       }
-      packet.payload = malloc(MTU);
+      packet.payload = calloc(MTU, sizeof(uint8_t));
+      if (packet.payload == NULL){
+        perror("No memory available\n");
+        exit(EXIT_FAILURE);
+      }
+
       packet.payload_size  = tun_read(tun_fd, packet.payload, MTU);
       if(packet.payload_size  == -1) {
-        printf("Error while reading from tun device\n");
-        exit(-1);
+        perror("Error while reading from tun device\n");
+        exit(EXIT_FAILURE);
       }
 
       printf("[DEBUG] Sending ICMP packet with payload_size: %d, payload: %s\n", packet.payload_size, packet.payload);
@@ -209,7 +242,7 @@ void run_tunnel(char *dest, int server)
       tun_write(tun_fd, packet.payload, packet.payload_size);
 
       printf("[DEBUG] Src address being copied: %s\n", packet.src_addr);
-      strcpy(dest, packet.src_addr);
+      strncpy(dest, packet.src_addr, strlen(packet.src_addr) + 1);
     }
   }
 
